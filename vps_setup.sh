@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────
+#  secure.sh — Fresh Ubuntu VPS hardening script
+#  Run as root on a brand-new server:
+#    chmod +x secure.sh && sudo ./secure.sh
+# ──────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ─── Colors & helpers ────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
+success() { echo -e "${GREEN}[  OK]${NC}  $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error()   { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
+
+# ─── Root check ──────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    error "This script must be run as root. Use: sudo ./secure.sh"
+fi
+
+echo ""
+echo -e "${CYAN}╔══════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║        🔒  VPS Hardening Script  🔒         ║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════╝${NC}"
+echo ""
+
+# ─── Prompt for SSH port ─────────────────────────────────────
+read -rp "$(echo -e "${YELLOW}Enter SSH port [default: 22]:${NC} ")" SSH_PORT
+SSH_PORT="${SSH_PORT:-22}"
+
+# Validate port number
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
+    error "Invalid port number: $SSH_PORT (must be 1-65535)"
+fi
+
+info "Using SSH port: $SSH_PORT"
+
+# ─── Prompt for deploy username ──────────────────────────────
+read -rp "$(echo -e "${YELLOW}Enter deploy username [default: deploy]:${NC} ")" DEPLOY_USER
+DEPLOY_USER="${DEPLOY_USER:-deploy}"
+info "Deploy user: $DEPLOY_USER"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════
+# 1. System update
+# ═══════════════════════════════════════════════════════════════
+info "Updating system packages..."
+apt update -y && apt upgrade -y
+success "System updated"
+
+# ═══════════════════════════════════════════════════════════════
+# 2. Install essential packages
+# ═══════════════════════════════════════════════════════════════
+info "Installing essential packages..."
+apt install -y \
+    fish \
+    fail2ban \
+    unattended-upgrades \
+    ufw \
+    curl \
+    wget \
+    git \
+    vim \
+    htop \
+    net-tools
+success "Essential packages installed"
+
+# ═══════════════════════════════════════════════════════════════
+# 2b. Install Fastfetch
+# ═══════════════════════════════════════════════════════════════
+info "Installing Fastfetch..."
+add-apt-repository -y ppa:zhangsongcui3371/fastfetch
+apt update -y
+apt install -y fastfetch
+success "Fastfetch installed"
+
+# ═══════════════════════════════════════════════════════════════
+# 3. Create deploy user with Fish shell
+# ═══════════════════════════════════════════════════════════════
+if id "$DEPLOY_USER" &>/dev/null; then
+    warn "User '$DEPLOY_USER' already exists — skipping creation"
+else
+    info "Creating user '$DEPLOY_USER'..."
+    adduser --gecos "" "$DEPLOY_USER"
+    usermod -aG sudo "$DEPLOY_USER"
+    success "User '$DEPLOY_USER' created and added to sudo group"
+fi
+
+# Keep Bash as default login shell (required for Dokploy and non-interactive SSH automation)
+chsh -s /bin/bash "$DEPLOY_USER"
+success "Bash kept as default login shell for '$DEPLOY_USER' (ensures compatibility with Dokploy/automation)"
+
+# Configure Fish to launch automatically only for interactive login sessions
+DEPLOY_HOME="/home/$DEPLOY_USER"
+if ! grep -q 'exec fish' "$DEPLOY_HOME/.bashrc" 2>/dev/null; then
+    cat <<'EOF' >> "$DEPLOY_HOME/.bashrc"
+
+# Launch Fish shell for interactive terminal sessions only
+if [[ $- == *i* ]] && command -v fish >/dev/null 2>&1; then
+    exec fish
+fi
+EOF
+    chown "$DEPLOY_USER":"$DEPLOY_USER" "$DEPLOY_HOME/.bashrc"
+    success "Configured Fish to auto-launch for interactive login sessions"
+fi
+if [[ -f /root/.ssh/authorized_keys ]]; then
+    info "Copying SSH authorized_keys to '$DEPLOY_USER'..."
+    mkdir -p "$DEPLOY_HOME/.ssh"
+    cp /root/.ssh/authorized_keys "$DEPLOY_HOME/.ssh/authorized_keys"
+    chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$DEPLOY_HOME/.ssh"
+    chmod 700 "$DEPLOY_HOME/.ssh"
+    chmod 600 "$DEPLOY_HOME/.ssh/authorized_keys"
+    success "SSH keys copied"
+else
+    warn "No /root/.ssh/authorized_keys found — make sure to add keys for '$DEPLOY_USER' manually!"
+fi
+
+# Give deploy user passwordless sudo
+echo "$DEPLOY_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$DEPLOY_USER"
+chmod 440 "/etc/sudoers.d/$DEPLOY_USER"
+success "Passwordless sudo configured for '$DEPLOY_USER'"
+
+# ═══════════════════════════════════════════════════════════════
+# 4. Harden SSH
+# ═══════════════════════════════════════════════════════════════
+info "Hardening SSH configuration..."
+
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_HARDENED="/etc/ssh/sshd_config.d/99-hardening.conf"
+
+# Back up original config
+cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)"
+
+cat > "$SSHD_HARDENED" <<EOF
+# ── VPS Hardening (generated by secure.sh) ──
+Port $SSH_PORT
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+MaxAuthTries 3
+X11Forwarding no
+AllowTcpForwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+EOF
+
+# Validate SSH config before restarting
+if sshd -t; then
+    success "SSH config is valid"
+else
+    error "SSH config test failed — check $SSHD_HARDENED"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# 5. Configure UFW firewall
+# ═══════════════════════════════════════════════════════════════
+info "Configuring UFW firewall..."
+
+ufw default deny incoming
+ufw default allow outgoing
+
+# Allow the chosen SSH port
+ufw allow "$SSH_PORT/tcp" comment "SSH"
+
+# Common web ports
+ufw allow 80/tcp  comment "HTTP"
+ufw allow 443/tcp comment "HTTPS"
+
+# Enable UFW (non-interactive)
+ufw --force enable
+success "UFW firewall enabled"
+
+# ═══════════════════════════════════════════════════════════════
+# 6. Configure Fail2Ban
+# ═══════════════════════════════════════════════════════════════
+info "Configuring Fail2Ban..."
+
+cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+# Whitelist loopback
+ignoreip  = 127.0.0.1/8 ::1
+bantime   = 1h
+findtime  = 10m
+maxretry  = 4
+banaction = ufw
+
+[sshd]
+enabled = true
+mode    = aggressive
+port    = $SSH_PORT
+backend = systemd
+EOF
+
+systemctl enable --now fail2ban
+systemctl restart fail2ban
+success "Fail2Ban configured and running"
+
+# ═══════════════════════════════════════════════════════════════
+# 7. Unattended security upgrades
+# ═══════════════════════════════════════════════════════════════
+info "Enabling unattended security upgrades..."
+
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+
+systemctl enable --now unattended-upgrades
+success "Unattended upgrades enabled"
+
+# ═══════════════════════════════════════════════════════════════
+# 8. Shared memory hardening
+# ═══════════════════════════════════════════════════════════════
+info "Hardening shared memory (/dev/shm)..."
+
+FSTAB_LINE="tmpfs /dev/shm tmpfs defaults,noexec,nosuid,nodev 0 0"
+
+if grep -q "/dev/shm" /etc/fstab; then
+    warn "/dev/shm already has an entry in /etc/fstab — skipping"
+else
+    echo "$FSTAB_LINE" >> /etc/fstab
+    mount -o remount /dev/shm 2>/dev/null || warn "Could not remount /dev/shm (may need reboot)"
+    success "Shared memory hardened"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# 9. Kernel security tweaks (sysctl)
+# ═══════════════════════════════════════════════════════════════
+info "Applying kernel security tweaks..."
+
+cat > /etc/sysctl.d/99-hardening.conf <<EOF
+# Prevent IP spoofing
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Ignore ICMP broadcast requests
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+# Disable source packet routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+
+# Ignore send redirects
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# Block SYN attacks
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 2
+
+# Log Martians
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# Disable IPv6 if not needed (uncomment if desired)
+# net.ipv6.conf.all.disable_ipv6 = 1
+# net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+
+sysctl --system > /dev/null 2>&1
+success "Kernel security tweaks applied"
+
+# ═══════════════════════════════════════════════════════════════
+# 10. Restart SSH
+# ═══════════════════════════════════════════════════════════════
+info "Restarting SSH service..."
+systemctl restart ssh 2>/dev/null || systemctl restart sshd
+success "SSH restarted on port $SSH_PORT"
+
+# ═══════════════════════════════════════════════════════════════
+# Done!
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║          ✅  VPS Hardened Successfully       ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${CYAN}Summary:${NC}"
+echo -e "  • Deploy user:     ${GREEN}$DEPLOY_USER${NC} (Fish shell)"
+echo -e "  • SSH port:        ${GREEN}$SSH_PORT${NC}"
+echo -e "  • Root login:      ${RED}Disabled${NC}"
+echo -e "  • Password auth:   ${GREEN}Enabled${NC} (key + password)"
+echo -e "  • Firewall (UFW):  ${GREEN}Enabled${NC} (ports $SSH_PORT, 80, 443)"
+echo -e "  • Fail2Ban:        ${GREEN}Running${NC}"
+echo -e "  • Auto-upgrades:   ${GREEN}Enabled${NC}"
+echo -e "  • /dev/shm:        ${GREEN}Hardened${NC}"
+echo -e "  • Kernel tweaks:   ${GREEN}Applied${NC}"
+echo ""
+echo -e "${YELLOW}⚠  IMPORTANT — before closing this session:${NC}"
+echo -e "  1. Open a ${CYAN}new terminal${NC} and test SSH as '$DEPLOY_USER':"
+echo -e "     ${CYAN}ssh -p $SSH_PORT $DEPLOY_USER@<your-server-ip>${NC}"
+echo -e "  2. Confirm you can ${CYAN}sudo${NC} successfully."
+echo -e "  3. Only then close this root session."
+echo ""
